@@ -209,6 +209,19 @@ class DatasetListResponse(BaseModel):
     datasets: list[DatasetResponse]
 
 
+class LifecycleEventResponse(BaseModel):
+    # One record per successful transition; same fields the audit row stores.
+    old_status: DatasetStatus
+    new_status: DatasetStatus
+    version: int
+    changed_at: str
+
+
+class LifecycleEventListResponse(BaseModel):
+    dataset_id: str
+    events: list[LifecycleEventResponse]
+
+
 class LifecycleRequest(BaseModel):
     # Optimistic-locking token: must equal the row's current version. The
     # version is incremented on every successful transition.

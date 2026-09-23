@@ -863,21 +863,6 @@ class ApiTests(unittest.TestCase):
 # --- Admin-managed dataset catalog ---
 # (catalog tests run inside ApiTests so they share its class-level server)
 
-
-def _grant_scope_directly(key_id: str, dataset_id: str) -> None:
-    """Add a scope row outside the API, so unknown/draft datasets can be
-    reached by a key and reach the catalog gate (rather than the 403 scope
-    check)."""
-    conn = connect()
-    try:
-        conn.execute(
-            "INSERT INTO api_key_scopes (key_id, dataset_id) VALUES (?, ?)",
-            (key_id, dataset_id),
-        )
-    finally:
-        conn.close()
-
-
     def test_30_admin_paths_require_admin_token(self) -> None:
         # No key.
         status, _ = _request(
@@ -1217,6 +1202,171 @@ def _grant_scope_directly(key_id: str, dataset_id: str) -> None:
         self.assertEqual(budget["used_budget"], 0.0)
         self.assertEqual(budget["remaining_budget"], 1.0)
 
+    # --- lifecycle change audit ---
+
+    def test_42_lifecycle_audit_records_transitions(self) -> None:
+        status, _ = _create_dataset("cat42")
+        self.assertEqual(status, 201)
+
+        # A draft dataset has no audit records yet.
+        status, body = _request(
+            "GET", "/admin/datasets/cat42/lifecycle/events", api_key=ADMIN_KEY
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body, {"dataset_id": "cat42", "events": []})
+
+        status, activate = _activate_dataset("cat42", version=0)
+        self.assertEqual(status, 200)
+        status, archive = _archive_dataset("cat42", version=1)
+        self.assertEqual(status, 200)
+
+        status, body = _request(
+            "GET", "/admin/datasets/cat42/lifecycle/events", api_key=ADMIN_KEY
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["dataset_id"], "cat42")
+        self.assertEqual(len(body["events"]), 2)
+        activation, archival = body["events"]
+        self.assertEqual(
+            activation,
+            {
+                "old_status": "draft",
+                "new_status": "active",
+                "version": 1,
+                "changed_at": activate["updated_at"],
+            },
+        )
+        self.assertEqual(
+            archival,
+            {
+                "old_status": "active",
+                "new_status": "archived",
+                "version": 2,
+                "changed_at": archive["updated_at"],
+            },
+        )
+
+    def test_43_audit_rejected_transitions_leave_no_records(self) -> None:
+        status, _ = _create_dataset("cat43")
+        self.assertEqual(status, 201)
+        status, _ = _activate_dataset("cat43")
+        self.assertEqual(status, 200)
+
+        # Illegal transition: activate an already-active dataset.
+        status, body = _activate_dataset("cat43", version=1)
+        self.assertEqual(status, 409)
+        # Stale/duplicate version.
+        status, body = _archive_dataset("cat43", version=0)
+        self.assertEqual(status, 409)
+        # Future version.
+        status, body = _archive_dataset("cat43", version=99)
+        self.assertEqual(status, 409)
+
+        status, fetched = _request(
+            "GET", "/admin/datasets/cat43/lifecycle/events", api_key=ADMIN_KEY
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(fetched["events"]), 1, fetched)
+        self.assertEqual(fetched["events"][0]["new_status"], "active")
+
+        # The legitimate archive still appends afterwards.
+        status, _ = _archive_dataset("cat43", version=1)
+        self.assertEqual(status, 200)
+        status, fetched = _request(
+            "GET", "/admin/datasets/cat43/lifecycle/events", api_key=ADMIN_KEY
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual([e["version"] for e in fetched["events"]], [1, 2])
+
+    def test_44_audit_pagination_and_unknown_dataset(self) -> None:
+        status, _ = _create_dataset("cat44")
+        self.assertEqual(status, 201)
+        status, _ = _activate_dataset("cat44")
+        self.assertEqual(status, 200)
+        status, _ = _archive_dataset("cat44", version=1)
+        self.assertEqual(status, 200)
+
+        # limit=1 pages in version order...
+        status, page1 = _request(
+            "GET", "/admin/datasets/cat44/lifecycle/events?limit=1",
+            api_key=ADMIN_KEY,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual([e["version"] for e in page1["events"]], [1])
+
+        # ...after_version is exclusive.
+        status, page2 = _request(
+            "GET",
+            "/admin/datasets/cat44/lifecycle/events?after_version=1&limit=1",
+            api_key=ADMIN_KEY,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [(e["old_status"], e["version"]) for e in page2["events"]],
+            [("active", 2)],
+        )
+
+        # No more records after the last version.
+        status, page3 = _request(
+            "GET",
+            "/admin/datasets/cat44/lifecycle/events?after_version=2",
+            api_key=ADMIN_KEY,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(page3["events"], [])
+
+        # Query parameter validation.
+        status, body = _request(
+            "GET",
+            "/admin/datasets/cat44/lifecycle/events?after_version=-1",
+            api_key=ADMIN_KEY,
+        )
+        self.assertEqual(status, 422)
+        status, _ = _request(
+            "GET", "/admin/datasets/cat44/lifecycle/events?limit=0",
+            api_key=ADMIN_KEY,
+        )
+        self.assertEqual(status, 422)
+        status, _ = _request(
+            "GET", "/admin/datasets/cat44/lifecycle/events?limit=101",
+            api_key=ADMIN_KEY,
+        )
+        self.assertEqual(status, 422)
+
+        # Unknown dataset keeps the existing 404 semantics.
+        status, body = _request(
+            "GET", "/admin/datasets/cat44-missing/lifecycle/events",
+            api_key=ADMIN_KEY,
+        )
+        self.assertEqual(status, 404, body)
+        self.assertEqual(body["detail"]["error"], "dataset_not_found")
+        self.assertEqual(body["detail"]["dataset_id"], "cat44-missing")
+
+        # The audit endpoint is admin-only: a data-plane key gets 403 and
+        # a missing key gets 401.
+        status, body = _request(
+            "GET", "/admin/datasets/cat44/lifecycle/events", api_key=DATA_KEY
+        )
+        self.assertEqual(status, 403)
+        status, _ = _request(
+            "GET", "/admin/datasets/cat44/lifecycle/events", api_key=""
+        )
+        self.assertEqual(status, 401)
+
+
+def _grant_scope_directly(key_id: str, dataset_id: str) -> None:
+    """Add a scope row outside the API, so unknown/draft datasets can be
+    reached by a key and reach the catalog gate (rather than the 403 scope
+    check)."""
+    conn = connect()
+    try:
+        conn.execute(
+            "INSERT INTO api_key_scopes (key_id, dataset_id) VALUES (?, ?)",
+            (key_id, dataset_id),
+        )
+    finally:
+        conn.close()
+
 
 class MigrationTests(unittest.TestCase):
     """Old schemas must upgrade in place (PRAGMA user_version)."""
@@ -1250,7 +1400,7 @@ class MigrationTests(unittest.TestCase):
 
         conn = connect(str(db_path))
         try:
-            self.assertEqual(int(conn.execute("PRAGMA user_version").fetchone()[0]), 3)
+            self.assertEqual(int(conn.execute("PRAGMA user_version").fetchone()[0]), 4)
             tables = {
                 r[0]
                 for r in conn.execute(
@@ -1260,6 +1410,7 @@ class MigrationTests(unittest.TestCase):
             self.assertIn("api_keys", tables)
             self.assertIn("api_key_scopes", tables)
             self.assertIn("datasets", tables)
+            self.assertIn("lifecycle_events", tables)
             # Existing data survives the migration.
             row = conn.execute(
                 "SELECT total, used FROM budgets WHERE dataset_id = 'old-ds'"
@@ -1311,7 +1462,7 @@ class MigrationTests(unittest.TestCase):
 
         conn = connect(str(db_path))
         try:
-            self.assertEqual(int(conn.execute("PRAGMA user_version").fetchone()[0]), 3)
+            self.assertEqual(int(conn.execute("PRAGMA user_version").fetchone()[0]), 4)
             row = conn.execute(
                 "SELECT status, default_budget FROM datasets WHERE dataset_id = ?",
                 ("scope-only-ds",),
@@ -1320,6 +1471,10 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(row["status"], "active")
             # No budget row existed: default comes from the configured total.
             self.assertEqual(row["default_budget"], 1.0)
+            # The audit log starts empty: no history is fabricated for
+            # transitions that happened before the table existed.
+            count = conn.execute("SELECT COUNT(*) FROM lifecycle_events").fetchone()[0]
+            self.assertEqual(count, 0)
         finally:
             conn.close()
 

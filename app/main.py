@@ -23,6 +23,8 @@ from .schemas import (
     DatasetListResponse,
     DatasetResponse,
     HealthResponse,
+    LifecycleEventListResponse,
+    LifecycleEventResponse,
     LifecycleRequest,
     ReleaseRequest,
     ReleaseResponse,
@@ -33,7 +35,7 @@ from .security import resolve_server_key
 
 app = FastAPI(
     title="Differential Privacy Budget Release API",
-    version="1.2.0",
+    version="1.3.0",
     description="Charges epsilon budgets transactionally and releases "
     "Laplace-noised aggregates with idempotent retries. All endpoints except "
     "/health and /docs require an X-API-Key header.",
@@ -444,12 +446,29 @@ def update_dataset_lifecycle(
                 },
             )
 
+        new_version = current_version + 1
+        # One timestamp is computed once inside the transaction and shared by
+        # the datasets update and the audit row, so they can never disagree.
+        changed_at = conn.execute(
+            "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+        ).fetchone()[0]
+
         conn.execute(
             "UPDATE datasets "
-            "SET status = ?, version = version + 1, "
-            "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') "
+            "SET status = ?, version = ?, updated_at = ? "
             "WHERE dataset_id = ?",
-            (next_status, dataset_id),
+            (next_status, new_version, changed_at, dataset_id),
+        )
+        # Audit insert rides the same BEGIN IMMEDIATE transaction: any failure
+        # above (unknown dataset, version conflict, illegal transition) rolls
+        # everything back, so rejected requests leave no record. The
+        # (dataset_id, version) primary key additionally forbids two events
+        # for the same version even under a writer race.
+        conn.execute(
+            "INSERT INTO lifecycle_events "
+            "(dataset_id, old_status, new_status, version, changed_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (dataset_id, current_status, next_status, new_version, changed_at),
         )
         row = _load_dataset(conn, dataset_id)
     return _row_to_dataset(row)
@@ -483,6 +502,73 @@ def list_datasets(
     finally:
         conn.close()
     return DatasetListResponse(datasets=[_row_to_dataset(row) for row in rows])
+
+
+def _row_to_lifecycle_event(row: sqlite3.Row) -> LifecycleEventResponse:
+    return LifecycleEventResponse(
+        old_status=row["old_status"],
+        new_status=row["new_status"],
+        version=int(row["version"]),
+        changed_at=row["changed_at"],
+    )
+
+
+@app.get(
+    "/admin/datasets/{dataset_id}/lifecycle/events",
+    response_model=LifecycleEventListResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["admin"],
+)
+def list_lifecycle_events(
+    dataset_id: str,
+    after_version: Optional[int] = Query(
+        default=None,
+        ge=0,
+        description="Return only records whose version is greater than this",
+    ),
+    limit: int = Query(
+        default=50,
+        ge=1,
+        le=100,
+        description="Maximum number of records to return (1-100)",
+    ),
+) -> LifecycleEventListResponse:
+    """Return the dataset's lifecycle change audit, version ascending.
+
+    Only successful activations/archives have records; conflicts and illegal
+    transitions roll back without writing any. Paginate with
+    ``after_version`` (exclusive): repeat the call with the last record's
+    ``version`` to fetch the next page. An unknown ``dataset_id`` returns the
+    same ``404 dataset_not_found`` as the other dataset endpoints; a known
+    dataset without transitions returns an empty list.
+    """
+    conn = connect()
+    try:
+        # 404 semantics match GET /budgets and the lifecycle PATCH: the
+        # dataset must exist in the catalog.
+        dataset = _load_dataset(conn, dataset_id)
+        if dataset is None:
+            raise _dataset_not_found(dataset_id)
+        if after_version is None:
+            rows = conn.execute(
+                "SELECT old_status, new_status, version, changed_at "
+                "FROM lifecycle_events WHERE dataset_id = ? "
+                "ORDER BY version ASC LIMIT ?",
+                (dataset_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT old_status, new_status, version, changed_at "
+                "FROM lifecycle_events WHERE dataset_id = ? AND version > ? "
+                "ORDER BY version ASC LIMIT ?",
+                (dataset_id, after_version, limit),
+            ).fetchall()
+    finally:
+        conn.close()
+    return LifecycleEventListResponse(
+        dataset_id=dataset_id,
+        events=[_row_to_lifecycle_event(row) for row in rows],
+    )
 
 
 def _row_to_release(row: sqlite3.Row) -> ReleaseResponse:

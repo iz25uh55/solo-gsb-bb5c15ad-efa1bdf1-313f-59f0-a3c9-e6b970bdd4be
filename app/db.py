@@ -99,6 +99,29 @@ MIGRATIONS: tuple[str, ...] = (
 
     PRAGMA user_version = 3;
     """,
+    # v4: append-only lifecycle change audit. A row is written in the SAME
+    # BEGIN IMMEDIATE transaction as the datasets status/version update, so a
+    # successful transition always has exactly one record and a rolled-back
+    # conflict/illegal transition leaves none. (Pre-v4 transitions are not
+    # fabricated: upgraded databases start with an empty audit log.)
+    """
+    CREATE TABLE IF NOT EXISTS lifecycle_events (
+        dataset_id TEXT NOT NULL,
+        -- Status before and after the transition ('draft'/'active'/'archived').
+        old_status TEXT NOT NULL
+                     CHECK (old_status IN ('draft', 'active', 'archived')),
+        new_status TEXT NOT NULL
+                     CHECK (new_status IN ('draft', 'active', 'archived')),
+        -- Dataset version produced by the transition (datasets.version after
+        -- the update); one event per version, starting at 1.
+        version    INTEGER NOT NULL,
+        changed_at TEXT NOT NULL,
+        PRIMARY KEY (dataset_id, version),
+        FOREIGN KEY (dataset_id) REFERENCES datasets(dataset_id)
+    );
+
+    PRAGMA user_version = 4;
+    """,
 )
 
 # Python hooks run after a given migration's DDL, inside one write
