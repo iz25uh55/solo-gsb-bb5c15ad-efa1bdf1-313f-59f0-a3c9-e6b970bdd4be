@@ -23,6 +23,8 @@ from .schemas import (
     DatasetListResponse,
     DatasetResponse,
     HealthResponse,
+    LifecycleAuditRecord,
+    LifecycleAuditResponse,
     LifecycleRequest,
     ReleaseRequest,
     ReleaseResponse,
@@ -33,7 +35,7 @@ from .security import resolve_server_key
 
 app = FastAPI(
     title="Differential Privacy Budget Release API",
-    version="1.2.0",
+    version="1.3.0",
     description="Charges epsilon budgets transactionally and releases "
     "Laplace-noised aggregates with idempotent retries. All endpoints except "
     "/health and /docs require an X-API-Key header.",
@@ -65,6 +67,16 @@ _TRANSFER_REPLAY_FIELDS = (
 
 # Float tolerance when comparing a retry against the stored release/transfer.
 _EPSILON_COMPARE_TOL = 1e-12
+
+# Default/max page size for the lifecycle audit listing.
+_AUDIT_DEFAULT_LIMIT = 50
+_AUDIT_MAX_LIMIT = 200
+
+
+def _utcnow_millis() -> str:
+    """UTC timestamp matching SQLite's '%Y-%m-%dT%H:%M:%fZ' (millisecond Z)."""
+    now = datetime.now(timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
 
 
 class _ReplayRelease(Exception):
@@ -411,6 +423,11 @@ def update_dataset_lifecycle(
     version returns ``409``, as does an illegal transition for the current
     status. Archived datasets reject new releases/transfers/grants but keep
     serving historical queries and idempotent replays.
+
+    Every successful transition appends one immutable row to
+    ``lifecycle_audits`` (old/new status, old/new version, timestamp) in the
+    *same* transaction as the status update; a conflict or illegal transition
+    rolls back and leaves no audit record.
     """
     with immediate_transaction() as conn:
         row = _load_dataset(conn, dataset_id)
@@ -444,12 +461,31 @@ def update_dataset_lifecycle(
                 },
             )
 
+        new_version = current_version + 1
+        changed_at = _utcnow_millis()
+        # The audit insert and the status/version update commit together;
+        # either both are visible after commit or neither (any failure above
+        # raises before this point and the context rolls the tx back).
         conn.execute(
             "UPDATE datasets "
-            "SET status = ?, version = version + 1, "
-            "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') "
+            "SET status = ?, version = ?, updated_at = ? "
             "WHERE dataset_id = ?",
-            (next_status, dataset_id),
+            (next_status, new_version, changed_at, dataset_id),
+        )
+        conn.execute(
+            "INSERT INTO lifecycle_audits ("
+            "dataset_id, action, from_status, to_status, "
+            "from_version, new_version, changed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                dataset_id,
+                payload.action,
+                current_status,
+                next_status,
+                current_version,
+                new_version,
+                changed_at,
+            ),
         )
         row = _load_dataset(conn, dataset_id)
     return _row_to_dataset(row)
@@ -483,6 +519,75 @@ def list_datasets(
     finally:
         conn.close()
     return DatasetListResponse(datasets=[_row_to_dataset(row) for row in rows])
+
+
+def _row_to_lifecycle_audit(row: sqlite3.Row) -> LifecycleAuditRecord:
+    return LifecycleAuditRecord(
+        dataset_id=row["dataset_id"],
+        action=row["action"],
+        from_status=row["from_status"],
+        to_status=row["to_status"],
+        from_version=int(row["from_version"]),
+        new_version=int(row["new_version"]),
+        changed_at=row["changed_at"],
+    )
+
+
+@app.get(
+    "/admin/datasets/{dataset_id}/audits",
+    response_model=LifecycleAuditResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["admin"],
+)
+def list_dataset_audits(
+    dataset_id: str,
+    after_version: Optional[int] = Query(
+        default=None,
+        ge=0,
+        description=(
+            "Return only records whose new_version is strictly greater than "
+            "this cursor (exclusive)"
+        ),
+    ),
+    limit: int = Query(
+        default=_AUDIT_DEFAULT_LIMIT,
+        ge=1,
+        le=_AUDIT_MAX_LIMIT,
+        description="Maximum number of records to return",
+    ),
+) -> LifecycleAuditResponse:
+    """Return the dataset's lifecycle change audit, version ascending.
+
+    One record exists per successful ``activate``/``archive`` (old status, new
+    status, old/new version and a UTC timestamp), written atomically with the
+    state change. Failed attempts (version conflicts, illegal transitions)
+    leave no record. Paginate with ``after_version`` (exclusive) and
+    ``limit``; pass the last record's ``new_version`` as the next cursor. An
+    unknown dataset returns ``404 dataset_not_found``.
+    """
+    conn = connect()
+    try:
+        dataset = _load_dataset(conn, dataset_id)
+        if dataset is None:
+            raise _dataset_not_found(dataset_id)
+        if after_version is None:
+            rows = conn.execute(
+                "SELECT * FROM lifecycle_audits WHERE dataset_id = ? "
+                "ORDER BY new_version ASC, id ASC LIMIT ?",
+                (dataset_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM lifecycle_audits "
+                "WHERE dataset_id = ? AND new_version > ? "
+                "ORDER BY new_version ASC, id ASC LIMIT ?",
+                (dataset_id, after_version, limit),
+            ).fetchall()
+    finally:
+        conn.close()
+    return LifecycleAuditResponse(
+        audits=[_row_to_lifecycle_audit(row) for row in rows]
+    )
 
 
 def _row_to_release(row: sqlite3.Row) -> ReleaseResponse:

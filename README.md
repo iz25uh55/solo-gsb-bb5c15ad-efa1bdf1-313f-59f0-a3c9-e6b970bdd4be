@@ -28,6 +28,14 @@ answers while charging a per-dataset ε (epsilon) privacy budget.
   historical queries and idempotent replays. Lifecycle changes use an
   optimistic version counter checked inside a SQLite transaction — stale or
   duplicate versions return `409`.
+- **Lifecycle audit trail:** every successful activation or archival appends
+  an immutable record (previous status, new status, previous version, new
+  version, UTC timestamp) in the *same* SQLite transaction as the state
+  change, so a committed transition always carries its audit row; conflicts
+  and illegal transitions roll back and leave no record. Administrators query
+  a dataset's history with
+  `GET /admin/datasets/{id}/audits` (version ascending, `after_version` +
+  `limit` pagination).
 
 ## Authentication
 
@@ -154,6 +162,12 @@ Apply one state-machine transition with optimistic concurrency control:
 every successful transition increments it by one and stamps `updated_at`.
 The whole check-and-update runs inside a single `BEGIN IMMEDIATE` transaction.
 
+On success the same transaction also appends one immutable row to the
+lifecycle audit trail containing the action, the previous and new status, the
+previous and new version, and a UTC timestamp. The audit row and the
+status/version update therefore commit or roll back together: a `409`
+(version conflict or illegal transition) never leaves an audit record.
+
 `200` returns the updated entry (new `status` and `version`). Conflict cases
 all return `409`:
 
@@ -169,6 +183,55 @@ Typical flow: `POST` (draft, v0) → `PATCH activate` with `version: 0`
 (active, v1) → `PATCH archive` with `version: 1` (archived, v2). Re-sending
 an old request body (e.g. activate with `version: 0` again) fails with
 `409 version_conflict` — clients must re-read the current version first.
+
+### `GET /admin/datasets/{dataset_id}/audits` (admin token only)
+
+Return the dataset's lifecycle change records ordered by version ascending
+(one record per successful `activate`/`archive`; datasets with no transitions
+return an empty list). Query parameters:
+
+- `after_version` (optional, integer `>= 0`) — exclusive cursor: only records
+  whose `new_version` is **strictly greater** than this value are returned.
+- `limit` (optional, integer `1`–`200`, default `50`) — page size.
+
+`200` response (after the create → activate → archive flow above):
+
+```json
+{
+  "audits": [
+    {
+      "dataset_id": "sales",
+      "action": "activate",
+      "from_status": "draft",
+      "to_status": "active",
+      "from_version": 0,
+      "new_version": 1,
+      "changed_at": "2026-09-23T10:00:05.123Z"
+    },
+    {
+      "dataset_id": "sales",
+      "action": "archive",
+      "from_status": "active",
+      "to_status": "archived",
+      "from_version": 1,
+      "new_version": 2,
+      "changed_at": "2026-09-23T10:00:12.456Z"
+    }
+  ]
+}
+```
+
+Paginate by passing the last record's `new_version` as `after_version` on the
+next request (e.g. `?after_version=2&limit=50`); a page whose length is below
+`limit` (or empty) means the end of the trail. Conflicts and illegal
+transitions are not recorded, so `new_version` values strictly increase with
+no gaps inside a dataset's history.
+
+Status codes: `200` success; `401` missing/invalid admin token; `403` a
+data-plane key was used (admin token required); `404 dataset_not_found` —
+unknown `dataset_id` (same semantics as the other dataset endpoints); `422`
+invalid query parameters (`limit` outside 1–200, negative
+`after_version`).
 
 ### `GET /admin/datasets` (admin token only)
 
@@ -221,6 +284,7 @@ request.
 | POST   | `/admin/datasets`       | admin token                  | Register a draft dataset with a default budget     |
 | PATCH  | `/admin/datasets/{id}/lifecycle` | admin token          | activate/archive with optimistic version check     |
 | GET    | `/admin/datasets`       | admin token                  | List catalog entries (`?status=` filter)           |
+| GET    | `/admin/datasets/{id}/audits` | admin token            | Lifecycle change audit (`after_version`, `limit`)  |
 | POST   | `/releases`             | API key covering `dataset_id`| Validate budget, deduct ε, return a noised release |
 | POST   | `/budgets/transfer`     | API key covering both sides  | Move unused ε quota between two active datasets    |
 | GET    | `/budgets/{dataset_id}` | API key covering the dataset | Used and remaining budget only                     |
@@ -514,6 +578,11 @@ curl -s -X PATCH http://localhost:8000/admin/datasets/sales/lifecycle \
   -H "X-API-Key: $DP_ADMIN_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"version":1,"action":"archive"}'
+
+# 5. Read the lifecycle audit (version ascending; paginate with
+#    ?after_version=<new_version>&limit=50).
+curl -s http://localhost:8000/admin/datasets/sales/audits \
+  -H "X-API-Key: $DP_ADMIN_API_KEY"
 ```
 
 ## Design notes
@@ -564,3 +633,16 @@ curl -s -X PATCH http://localhost:8000/admin/datasets/sales/lifecycle \
   budget totals) for every dataset referenced by pre-existing budgets,
   releases, transfers or key scopes, so upgrading an old database changes no
   behavior.
+- **Lifecycle audit trail:** the v4 migration adds the append-only
+  `lifecycle_audits` table (`dataset_id`, `action`, `from_status`,
+  `to_status`, `from_version`, `new_version`, `changed_at`, with
+  `UNIQUE(dataset_id, new_version)`). A successful PATCH inserts its audit
+  row inside the *same* `BEGIN IMMEDIATE` transaction as the
+  status/version/`updated_at` update (and reuses that exact timestamp), so a
+  committed change is always audited; any `409` path raises before the write
+  and the context manager rolls the transaction back, leaving no record of
+  failed attempts. The upgrade creates the table empty — pre-upgrade
+  transitions are not reconstructed. `GET /admin/datasets/{id}/audits`
+  returns records `ORDER BY new_version ASC` with an exclusive
+  `after_version` cursor and a bounded `limit`; an unknown dataset first
+  probes `datasets` and returns the standard `404 dataset_not_found`.

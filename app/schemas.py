@@ -209,6 +209,24 @@ class DatasetListResponse(BaseModel):
     datasets: list[DatasetResponse]
 
 
+class LifecycleAuditRecord(BaseModel):
+    dataset_id: str
+    action: LifecycleAction
+    from_status: DatasetStatus
+    to_status: DatasetStatus
+    from_version: int
+    new_version: int
+    changed_at: str = Field(
+        ..., description="UTC ISO-8601 timestamp of the committed transition"
+    )
+
+
+class LifecycleAuditResponse(BaseModel):
+    # Records ordered by version ascending (new_version within one dataset is
+    # strictly increasing, one per successful transition).
+    audits: list[LifecycleAuditRecord]
+
+
 class LifecycleRequest(BaseModel):
     # Optimistic-locking token: must equal the row's current version. The
     # version is incremented on every successful transition.

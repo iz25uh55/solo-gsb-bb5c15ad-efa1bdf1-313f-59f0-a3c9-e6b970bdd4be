@@ -99,6 +99,33 @@ MIGRATIONS: tuple[str, ...] = (
 
     PRAGMA user_version = 3;
     """,
+    # v4: append-only lifecycle audit trail. A row is written in the same
+    # BEGIN IMMEDIATE transaction as the dataset status/version update it
+    # describes, so a committed state change always carries its audit record;
+    # conflicts and illegal transitions roll back and leave no trace. No rows
+    # are backfilled for transitions that happened before the upgrade.
+    """
+    CREATE TABLE IF NOT EXISTS lifecycle_audits (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        dataset_id    TEXT NOT NULL,
+        -- Lifecycle action that produced the change ('activate'/'archive').
+        action        TEXT NOT NULL,
+        from_status   TEXT NOT NULL
+                        CHECK (from_status IN ('draft', 'active', 'archived')),
+        to_status     TEXT NOT NULL
+                        CHECK (to_status IN ('draft', 'active', 'archived')),
+        from_version  INTEGER NOT NULL,
+        new_version   INTEGER NOT NULL,
+        changed_at    TEXT NOT NULL,
+        FOREIGN KEY (dataset_id) REFERENCES datasets(dataset_id),
+        UNIQUE (dataset_id, new_version)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_lifecycle_audits_dataset_version
+        ON lifecycle_audits(dataset_id, new_version);
+
+    PRAGMA user_version = 4;
+    """,
 )
 
 # Python hooks run after a given migration's DDL, inside one write
